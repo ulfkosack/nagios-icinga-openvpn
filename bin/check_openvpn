@@ -22,6 +22,10 @@ MAX_P_CONTROL_SIZE = 128 # TODO: adopt
 MAX_CIPHER_KEY_LENGTH = 64
 MAX_HMAC_KEY_LENGTH = 64
 BUFFER_SIZE = 1024
+# tls-crypt: AES-256-CTR und HMAC-SHA256, siehe openvpn "src/openvpn/tls_crypt.c"
+TLS_CRYPT_KEY_LENGTH = 32
+TLS_CRYPT_TAG_SIZE = 32
+TLS_CRYPT_HEADER_SIZE = 1 + 8 + 4 + 4 # opcode, session id, packet id, net time
 
 ALGORITHMS_AVAILABLE = hashlib.algorithms_available
 
@@ -116,9 +120,61 @@ def validate_p_control_hard_reset_server_v2(packet, query_sid, digest, digest_si
         return 1
     return 0
 
-def check(host, port, tcp, timeout, digest, digest_size, client_key, server_key, retrycount, validate, family=socket.AF_UNSPEC):
+def aes256_ctr(key, iv, data):
+    # Erst hier importieren, damit "cryptography" nur für --tls-crypt nötig ist
+    from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+    cipher = Cipher(algorithms.AES(key), modes.CTR(iv)).encryptor()
+    return cipher.update(data) + cipher.finalize()
+
+def tls_crypt_keys(key):
+    # Der Client nutzt bei tls-crypt immer die inverse Richtung:
+    # senden mit Schlüssel 1, empfangen mit Schlüssel 0 (je 64 Byte Cipher + 64 Byte HMAC)
+    def part(index, offset):
+        start = index * (MAX_CIPHER_KEY_LENGTH + MAX_HMAC_KEY_LENGTH) + offset
+        return key[start:start + TLS_CRYPT_KEY_LENGTH]
+    send = (part(1, 0), part(1, MAX_CIPHER_KEY_LENGTH))
+    recv = (part(0, 0), part(0, MAX_CIPHER_KEY_LENGTH))
+    return send, recv
+
+def build_tls_crypt_hard_reset_client_v2(sid, keys):
+    # see openvpn source code "src/openvpn/tls_crypt.c" function tls_crypt_wrap
+    cipher_key, hmac_key = keys
+    header = struct.pack('>B', P_CONTROL_HARD_RESET_CLIENT_V2 << 3) # packet type
+    header += sid # session id
+    header += struct.pack('>I', 1) # packet id
+    header += struct.pack('>I', int(time.time())) # net time
+    plaintext = struct.pack('>B', 0) # message packet id array length
+    plaintext += struct.pack('>I', 0) # message packet id
+    tag = hmac.new(hmac_key, header + plaintext, hashlib.sha256).digest()
+    return header + tag + aes256_ctr(cipher_key, tag[:16], plaintext)
+
+def validate_tls_crypt_hard_reset_server_v2(packet, query_sid, keys):
+    # see openvpn source code "src/openvpn/tls_crypt.c" function tls_crypt_unwrap
+    # Rückgabe wie validate_p_control_hard_reset_server_v2: 1 = ok mit HMAC, 10 = HMAC falsch, 20 = ungültig
+    cipher_key, hmac_key = keys
+    if len(packet) < TLS_CRYPT_HEADER_SIZE + TLS_CRYPT_TAG_SIZE + 5: return 20
+    if packet[0] != P_CONTROL_HARD_RESET_SERVER_V2 << 3: return 20
+    header = packet[:TLS_CRYPT_HEADER_SIZE]
+    tag = packet[TLS_CRYPT_HEADER_SIZE:TLS_CRYPT_HEADER_SIZE + TLS_CRYPT_TAG_SIZE]
+    plaintext = aes256_ctr(cipher_key, tag[:16], packet[TLS_CRYPT_HEADER_SIZE + TLS_CRYPT_TAG_SIZE:])
+    if not hmac.compare_digest(tag, hmac.new(hmac_key, header + plaintext, hashlib.sha256).digest()):
+        return 10
+    # Klartext: Länge des ACK-Arrays, ACKs, ggf. remote session id, message packet id
+    mpidlen = plaintext[0]
+    offset = 1 + 4 * mpidlen
+    if mpidlen:
+        if plaintext[offset:offset + 8] != query_sid: return 20
+        offset += 8
+    if len(plaintext) < offset + 4: return 20
+    if struct.unpack('>I', plaintext[offset:offset + 4])[0] != 0: return 20
+    return 1
+
+def check(host, port, tcp, timeout, digest, digest_size, client_key, server_key, retrycount, validate, family=socket.AF_UNSPEC, tls_crypt=None):
     sid = os.urandom(8) # session id
-    packet = build_p_control_hard_reset_client_v2(sid, digest, client_key)
+    if tls_crypt:
+        packet = build_tls_crypt_hard_reset_client_v2(sid, tls_crypt[0])
+    else:
+        packet = build_p_control_hard_reset_client_v2(sid, digest, client_key)
     query_server = query_tcp_server if tcp else query_udp_server
 
     try:
@@ -143,7 +199,10 @@ def check(host, port, tcp, timeout, digest, digest_size, client_key, server_key,
     # for debugging purpose
     # response = binascii.hexlify(response)
     if not validate: return ok('Responded')
-    valid = validate_p_control_hard_reset_server_v2(response, sid, digest, digest_size, server_key)
+    if tls_crypt:
+        valid = validate_tls_crypt_hard_reset_server_v2(response, sid, tls_crypt[1])
+    else:
+        valid = validate_p_control_hard_reset_server_v2(response, sid, digest, digest_size, server_key)
     if valid == 0: return ok('Response validated')
     if valid == 1: return ok('Response validated, checked HMAC')
     if valid == 10: return warning('Invalid HMAC')
@@ -195,8 +254,10 @@ def readkey(path):
         return None
     index_start += 2
     key = key[index_start:index_end].replace('\n', '').replace('\r', '')
-    key = binascii.unhexlify(key)
-    return key
+    try:
+        return binascii.unhexlify(key)
+    except (binascii.Error, ValueError):
+        return None
 
 def optionsparser(argv=None):
     parser = argparse.ArgumentParser()
@@ -211,8 +272,13 @@ def optionsparser(argv=None):
     parser.add_argument('--digest-key-client', help='set client HMAC key')
     parser.add_argument('--digest-key-server', help='set server HMAC key for packet validation')
     parser.add_argument('--tls-auth', help='set tls-auth file')
-    # TODO: direction argument (normal, inverse)
-    parser.add_argument('--tls-auth-inverse', help='set tls-auth file direction to inverse (1)', action='store_true')
+    # Siehe https://github.com/liquidat/nagios-icinga-openvpn/issues/23
+    parser.add_argument('--key-direction', choices=['0', '1', 'bidirectional'],
+                        help='tls-auth key direction, use the "key-direction" value of the client config;'
+                             ' "bidirectional" if the config has none (default is 1)')
+    parser.add_argument('--tls-auth-inverse', help='same as --key-direction 0 (kept for compatibility)', action='store_true')
+    # Siehe https://github.com/liquidat/nagios-icinga-openvpn/issues/22
+    parser.add_argument('--tls-crypt', help='set tls-crypt file (requires the Python module "cryptography")')
     parser.add_argument('--retrycount', help='number of udp retries before giving up (default is %(default)d)', type=int, default=3)
     parser.add_argument('--no-validation', help='do not validate response', action='store_true')
     parser.add_argument('host', help='the OpenVPN host name or IP')
@@ -227,6 +293,24 @@ def main(argv=None):
         return critical('retry count must be positive')
     if args.tls_auth and (args.digest_key_client or args.digest_key_server):
         return critical('--tls-auth cannot go with --digest-key')
+    if (args.key_direction or args.tls_auth_inverse) and not args.tls_auth:
+        return critical('--key-direction and --tls-auth-inverse require --tls-auth')
+    if args.tls_auth_inverse and args.key_direction not in (None, '0'):
+        return critical('--tls-auth-inverse cannot go with --key-direction ' + args.key_direction)
+    key_direction = '0' if args.tls_auth_inverse else (args.key_direction or '1')
+    if args.tls_crypt and (args.tls_auth or args.digest_key_client or args.digest_key_server):
+        return critical('--tls-crypt cannot go with --tls-auth or --digest-key')
+
+    tls_crypt = None
+    if args.tls_crypt:
+        try:
+            import cryptography  # noqa: F401
+        except ImportError:
+            return critical('--tls-crypt requires the Python module "cryptography"')
+        key = readkey(args.tls_crypt)
+        if key is None or len(key) < 2 * (MAX_CIPHER_KEY_LENGTH + MAX_HMAC_KEY_LENGTH):
+            return critical('cannot read tls crypt file')
+        tls_crypt = tls_crypt_keys(key)
 
     client_key = binascii.unhexlify(args.digest_key_client) if args.digest_key_client else None
     server_key = binascii.unhexlify(args.digest_key_server) if args.digest_key_server else None
@@ -247,18 +331,23 @@ def main(argv=None):
         # 64 byte cipher direction 0, 64 byte hmac direction 0, 64 byte cipher direction 1, 64 byte hmac direction 1 (=> 2048 bit)
         key = readkey(args.tls_auth)
         if key is None: return critical('cannot read tls auth file')
-        index_start = MAX_CIPHER_KEY_LENGTH + MAX_HMAC_KEY_LENGTH + MAX_CIPHER_KEY_LENGTH
-        index_end = index_start + MAX_HMAC_KEY_LENGTH
-        client_key = key[index_start:index_end]
         index_start = MAX_CIPHER_KEY_LENGTH
-        index_end = index_start + MAX_HMAC_KEY_LENGTH
-        server_key = key[index_start:index_end]
-        if args.tls_auth_inverse: client_key, server_key = server_key, client_key
+        hmac_key_0 = key[index_start:index_start + MAX_HMAC_KEY_LENGTH]
+        index_start = MAX_CIPHER_KEY_LENGTH + MAX_HMAC_KEY_LENGTH + MAX_CIPHER_KEY_LENGTH
+        hmac_key_1 = key[index_start:index_start + MAX_HMAC_KEY_LENGTH]
+        # Wie OpenVPN: key-direction 1 sendet mit Schlüssel 1 und prüft mit Schlüssel 0,
+        # key-direction 0 umgekehrt, ohne key-direction nutzen beide Seiten Schlüssel 0.
+        if key_direction == '1':
+            client_key, server_key = hmac_key_1, hmac_key_0
+        elif key_direction == '0':
+            client_key, server_key = hmac_key_0, hmac_key_1
+        else:
+            client_key = server_key = hmac_key_0
         # reduce key size to required size
         client_key = client_key[:digest_size]
         server_key = server_key[:digest_size]
 
-    return check(args.host, args.port, args.tcp, args.timeout, digest, digest_size, client_key, server_key, args.retrycount, not args.no_validation, args.family)
+    return check(args.host, args.port, args.tcp, args.timeout, digest, digest_size, client_key, server_key, args.retrycount, not args.no_validation, args.family, tls_crypt)
 
 if __name__ == '__main__':
     code = main()

@@ -14,6 +14,8 @@ setup(
   long_description=long_description,
   long_description_content_type='text/markdown',
   license      = 'MIT',
+  # nur für --tls-crypt nötig: pip install nagios-icinga-openvpn[tls-crypt]
+  extras_require = {'tls-crypt': ['cryptography']},
   classifiers  = [
     'License :: OSI Approved :: MIT License',
     'Programming Language :: Python',
