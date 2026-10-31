@@ -9,8 +9,8 @@ The checks must be run on the monitoring server
 The plugin is a normal check which must be run on the monitoring server. It queries the target OpenVPN server and outputs OK, etc.
 ```
 $ ./check_openvpn -h
-usage: check_openvpn [-h] [-p PORT] [-t] [--timeout TIMEOUT] [--digest DIGEST]
-                     [--digest-size DIGEST_SIZE]
+usage: check_openvpn [-h] [-p PORT] [-t] [-4 | -6] [--timeout TIMEOUT]
+                     [--digest DIGEST] [--digest-size DIGEST_SIZE]
                      [--digest-key-client DIGEST_KEY_CLIENT]
                      [--digest-key-server DIGEST_KEY_SERVER]
                      [--tls-auth TLS_AUTH] [--tls-auth-inverse]
@@ -24,6 +24,8 @@ optional arguments:
   -h, --help            show this help message and exit
   -p PORT, --port PORT  set port number (default is 1194)
   -t, --tcp             use tcp instead of udp
+  -4, --ipv4            use IPv4 only
+  -6, --ipv6            use IPv6 only
   --timeout TIMEOUT     set timeout in seconds, for udp counted per packet
                         (default is 2)
   --digest DIGEST       set digest algorithm (default is "sha1")

@@ -1,0 +1,4 @@
+# Ältestes unterstütztes Python (ruff kennt nichts unter 3.7).
+# Verhindert z. B. die Umstellung socket.timeout -> TimeoutError,
+# die erst ab Python 3.10 gleichwertig ist.
+target-version = "py37"

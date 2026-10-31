@@ -1,17 +1,20 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 #
 # Check if an OpenVPN server runs on a given UDP or TCP port.
 #
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2013-2019 Roland Wolters and contributors (see AUTHORS)
+#
 
-import os
-import sys
-import time
-import hmac
-import hashlib
-import struct
-import socket
 import argparse
 import binascii
+import hashlib
+import hmac
+import os
+import socket
+import struct
+import sys
+import time
 
 P_CONTROL_HARD_RESET_CLIENT_V2 = 7
 P_CONTROL_HARD_RESET_SERVER_V2 = 8
@@ -20,18 +23,18 @@ MAX_CIPHER_KEY_LENGTH = 64
 MAX_HMAC_KEY_LENGTH = 64
 BUFFER_SIZE = 1024
 
-ALGORITHMS_AVAILABLE = hashlib.algorithms_available if hasattr(hashlib, "algorithms_available") else hashlib.algorithms
+ALGORITHMS_AVAILABLE = hashlib.algorithms_available
 
 def ok(msg):
-    print('OK: %s' % msg)
+    print(f'OK: {msg}')
     return 0
 
 def warning(msg):
-    print('WARN: %s' % msg)
+    print(f'WARN: {msg}')
     return 1
 
 def critical(msg):
-    print('CRIT: %s' % msg)
+    print(f'CRIT: {msg}')
     return 2
 
 def build_p_control_hard_reset_client_v2(sid, digest, key):
@@ -39,6 +42,10 @@ def build_p_control_hard_reset_client_v2(sid, digest, key):
     pid = 1 # packet id
     ts = int(time.time())  # net time
 
+    # build packet
+    result = b''
+    result += struct.pack('>B', P_CONTROL_HARD_RESET_CLIENT_V2 << 3) # packet type
+    result += sid # session id
     if key:
         # generate hmac
         h = hmac.new(key, digestmod=digest)
@@ -48,14 +55,9 @@ def build_p_control_hard_reset_client_v2(sid, digest, key):
         h.update(sid) # session id
         h.update(struct.pack('>B', 0)) # message packet id array length
         h.update(struct.pack('>I', 0)) # message packet id
-
-    # build packet
-    result = b''
-    result += struct.pack('>B', P_CONTROL_HARD_RESET_CLIENT_V2 << 3) # packet type
-    result += sid # session id
-    if key: result += h.digest() # hmac
-    if key: result += struct.pack('>I', pid) # packet id
-    if key: result += struct.pack('>I', ts) # net time
+        result += h.digest() # hmac
+        result += struct.pack('>I', pid) # packet id
+        result += struct.pack('>I', ts) # net time
     result += struct.pack('>B', 0) # message packet id array length
     result += struct.pack('>I', 0) # message packet id
     return result
@@ -63,13 +65,15 @@ def build_p_control_hard_reset_client_v2(sid, digest, key):
 def validate_p_control_hard_reset_server_v2(packet, query_sid, digest, digest_size, key):
     # see openvpn source code "src/openvpn/crypto.c" function openvpn_decrypt_v1
     # identify packet
-    if False: pass
-    elif len(packet) - struct.unpack('>B', packet[9:10])[0] * 4 == 14: plen = 0 # type sid mpida mpid
+    if len(packet) - struct.unpack('>B', packet[9:10])[0] * 4 == 14: plen = 0 # type sid mpida mpid
     elif len(packet) - struct.unpack('>B', packet[9:10])[0] * 4 == 22: plen = 1 # type sid mpida rsid mpid
     elif len(packet) - struct.unpack('>B', packet[17+digest_size:18+digest_size])[0] * 4 == 30+digest_size: plen = 2 # type sid hmac pid ts mpida rsid mpid
     else: return 20
 
     # parse packet
+    # Vorbelegung für Felder, die nur bei plen >= 1 bzw. >= 2 im Paket stehen
+    phmac = rsid = b''
+    pid = ts = 0
     ptype = struct.unpack('>B', packet[:1])[0] # packet type
     packet = packet[1:]
     sid = packet[:8] # session id
@@ -84,7 +88,7 @@ def validate_p_control_hard_reset_server_v2(packet, query_sid, digest, digest_si
     mpidlen = struct.unpack('>B', packet[:1])[0] # message packet id array length
     packet = packet[1:]
     mpidarray = [] # packet id array
-    for i in range(mpidlen):
+    for _ in range(mpidlen):
         mpidarray.append(struct.unpack('>I', packet[:4])[0]) # message packet id array element
         packet = packet[4:]
     if plen >= 1:
@@ -112,21 +116,23 @@ def validate_p_control_hard_reset_server_v2(packet, query_sid, digest, digest_si
         return 1
     return 0
 
-def check(host, port, tcp, timeout, digest, digest_size, client_key, server_key, retrycount, validate):
+def check(host, port, tcp, timeout, digest, digest_size, client_key, server_key, retrycount, validate, family=socket.AF_UNSPEC):
     sid = os.urandom(8) # session id
     packet = build_p_control_hard_reset_client_v2(sid, digest, client_key)
     query_server = query_tcp_server if tcp else query_udp_server
 
     try:
-        s = create_socket(host, port, tcp, timeout)
-    except socket.error:
+        s, addr = create_socket(host, port, tcp, timeout, family)
+    except socket.gaierror:
+        return critical('Unable to resolve host')
+    except OSError:
         return critical('Unable to create socket')
 
     try:
-        response = query_server(s, host, port, packet, retrycount)
+        response = query_server(s, addr, packet, retrycount)
     except RuntimeError:
         return critical('Invalid response')
-    except:
+    except (OSError, struct.error):
         return critical('Not responding')
     finally:
         s.close()
@@ -143,32 +149,34 @@ def check(host, port, tcp, timeout, digest, digest_size, client_key, server_key,
     if valid == 10: return warning('Invalid HMAC')
     return critical('Invalid response')
 
-def create_socket(host, port, tcp, timeout):
+def create_socket(host, port, tcp, timeout, family=socket.AF_UNSPEC):
     # thanks to glucas for the idea
+    # family: AF_INET (-4), AF_INET6 (-6) oder AF_UNSPEC (erste aufgelöste Adresse)
     sock_type = socket.SOCK_STREAM if tcp else socket.SOCK_DGRAM
-    af, socktype, proto, canonname, sa = socket.getaddrinfo(host, port, socket.AF_UNSPEC, sock_type)[0]
+    af, socktype, proto, _canonname, sa = socket.getaddrinfo(host, port, family, sock_type)[0]
     s = socket.socket(af, socktype, proto)
     s.settimeout(timeout)
-    return s
+    # Die aufgelöste Adresse zurückgeben, damit sendto/connect nicht neu auflösen
+    return s, sa
 
-def query_udp_server(s, host, port, packet, retrycount):
+def query_udp_server(s, addr, packet, retrycount):
     # Send up to 'retrycount' UDP packets with 'timeout' secs between each.
     # Return data after receiving first UDP packet.
-    for i in range(retrycount):
+    for _ in range(retrycount):
         try:
-            s.sendto(packet, (host, port))
+            s.sendto(packet, addr)
             # TODO: check response address
             data, _ = s.recvfrom(BUFFER_SIZE)
             return data
         except socket.timeout:
             pass
-        except:
+        except OSError:
             return None
     return None
 
-def query_tcp_server(s, host, port, packet, retrycount):
+def query_tcp_server(s, addr, packet, retrycount):
     # ignore retrycount
-    s.connect((host, port))
+    s.connect(addr)
     s.send(struct.pack('>H', len(packet)) + packet)
     length = struct.unpack('>H', s.recv(2))[0]
     if length > MAX_P_CONTROL_SIZE: raise RuntimeError
@@ -177,13 +185,12 @@ def query_tcp_server(s, host, port, packet, retrycount):
     return data
 
 def readkey(path):
-    key = None
     try:
-        with open(path, 'r') as myfile: key = myfile.read()
-    except:
+        with open(path) as myfile: key = myfile.read()
+    except (OSError, UnicodeDecodeError):
         return None
-    index_start = key.find('-\n');
-    index_end = key.find('\n-', index_start);
+    index_start = key.find('-\n')
+    index_end = key.find('\n-', index_start)
     if index_start < 0 or index_end < 0 or index_end <= index_start:
         return None
     index_start += 2
@@ -195,6 +202,9 @@ def optionsparser(argv=None):
     parser = argparse.ArgumentParser()
     parser.add_argument('-p', '--port', help='set port number (default is %(default)d)', type=int, default=1194)
     parser.add_argument('-t', '--tcp', help='use tcp instead of udp', action='store_true')
+    family = parser.add_mutually_exclusive_group()
+    family.add_argument('-4', '--ipv4', dest='family', help='use IPv4 only', action='store_const', const=socket.AF_INET, default=socket.AF_UNSPEC)
+    family.add_argument('-6', '--ipv6', dest='family', help='use IPv6 only', action='store_const', const=socket.AF_INET6)
     parser.add_argument('--timeout', help='set timeout in seconds, for udp counted per packet (default is %(default)d)', type=int, default=2)
     parser.add_argument('--digest', help='set digest algorithm (default is "%(default)s")', default='sha1')
     parser.add_argument('--digest-size', help='set HMAC digest size', type=int)
@@ -212,11 +222,11 @@ def main(argv=None):
     args = optionsparser(argv)
 
     if args.digest_size and args.digest_size < 0:
-        critical('digest size must be positive')
+        return critical('digest size must be positive')
     if args.retrycount < 1:
-        critical('retry count must be positive')
+        return critical('retry count must be positive')
     if args.tls_auth and (args.digest_key_client or args.digest_key_server):
-        critical('--tls-auth cannot go with --digest-key')
+        return critical('--tls-auth cannot go with --digest-key')
 
     client_key = binascii.unhexlify(args.digest_key_client) if args.digest_key_client else None
     server_key = binascii.unhexlify(args.digest_key_server) if args.digest_key_server else None
@@ -229,14 +239,14 @@ def main(argv=None):
     try:
         digest = getattr(hashlib, digest)
         if not digest_size: digest_size = digest().digest_size
-    except:
+    except (AttributeError, TypeError, ValueError):
         return critical('digest creation failed')
 
     if args.tls_auth:
         # see openvpn source code "src/openvpn/crypto.h", "src/openvpn/crypto.c" and "src/openvpn/crypto_backend.h"
         # 64 byte cipher direction 0, 64 byte hmac direction 0, 64 byte cipher direction 1, 64 byte hmac direction 1 (=> 2048 bit)
         key = readkey(args.tls_auth)
-        if key == None: return critical('cannot read tls auth file')
+        if key is None: return critical('cannot read tls auth file')
         index_start = MAX_CIPHER_KEY_LENGTH + MAX_HMAC_KEY_LENGTH + MAX_CIPHER_KEY_LENGTH
         index_end = index_start + MAX_HMAC_KEY_LENGTH
         client_key = key[index_start:index_end]
@@ -248,7 +258,7 @@ def main(argv=None):
         client_key = client_key[:digest_size]
         server_key = server_key[:digest_size]
 
-    return check(args.host, args.port, args.tcp, args.timeout, digest, digest_size, client_key, server_key, args.retrycount, not args.no_validation)
+    return check(args.host, args.port, args.tcp, args.timeout, digest, digest_size, client_key, server_key, args.retrycount, not args.no_validation, args.family)
 
 if __name__ == '__main__':
     code = main()
