@@ -69,9 +69,20 @@ def build_p_control_hard_reset_client_v2(sid, digest, key):
 def validate_p_control_hard_reset_server_v2(packet, query_sid, digest, digest_size, key):
     # see openvpn source code "src/openvpn/crypto.c" function openvpn_decrypt_v1
     # identify packet
-    if len(packet) - struct.unpack('>B', packet[9:10])[0] * 4 == 14: plen = 0 # type sid mpida mpid
-    elif len(packet) - struct.unpack('>B', packet[9:10])[0] * 4 == 22: plen = 1 # type sid mpida rsid mpid
-    elif len(packet) - struct.unpack('>B', packet[17+digest_size:18+digest_size])[0] * 4 == 30+digest_size: plen = 2 # type sid hmac pid ts mpida rsid mpid
+    def layout_matches(mpidlen_offset, base_length):
+        # Passt die Paketlänge zur ACK-Länge an dieser Stelle? Zu kurze Pakete passen nie.
+        if len(packet) <= mpidlen_offset: return False
+        return len(packet) - packet[mpidlen_offset] * 4 == base_length
+    layouts = [
+        (0, 9, 14), # type sid mpida mpid
+        (1, 9, 22), # type sid mpida rsid mpid
+        (2, 17 + digest_size, 30 + digest_size), # type sid hmac pid ts mpida rsid mpid
+    ]
+    # Mit Schlüssel zuerst die Variante mit HMAC prüfen: Byte 9 ist dort das erste
+    # HMAC-Byte und kann sonst zufällig wie eine passende ACK-Länge aussehen.
+    if key: layouts.insert(0, layouts.pop())
+    for plen, mpidlen_offset, base_length in layouts:
+        if layout_matches(mpidlen_offset, base_length): break
     else: return 20
 
     # parse packet
@@ -312,8 +323,14 @@ def main(argv=None):
             return critical('cannot read tls crypt file')
         tls_crypt = tls_crypt_keys(key)
 
-    client_key = binascii.unhexlify(args.digest_key_client) if args.digest_key_client else None
-    server_key = binascii.unhexlify(args.digest_key_server) if args.digest_key_server else None
+    try:
+        client_key = binascii.unhexlify(args.digest_key_client) if args.digest_key_client else None
+    except (binascii.Error, ValueError):
+        return critical('--digest-key-client is not a valid hex string')
+    try:
+        server_key = binascii.unhexlify(args.digest_key_server) if args.digest_key_server else None
+    except (binascii.Error, ValueError):
+        return critical('--digest-key-server is not a valid hex string')
     digest = args.digest
     digest_size = args.digest_size
 
@@ -330,7 +347,8 @@ def main(argv=None):
         # see openvpn source code "src/openvpn/crypto.h", "src/openvpn/crypto.c" and "src/openvpn/crypto_backend.h"
         # 64 byte cipher direction 0, 64 byte hmac direction 0, 64 byte cipher direction 1, 64 byte hmac direction 1 (=> 2048 bit)
         key = readkey(args.tls_auth)
-        if key is None: return critical('cannot read tls auth file')
+        if key is None or len(key) < 2 * (MAX_CIPHER_KEY_LENGTH + MAX_HMAC_KEY_LENGTH):
+            return critical('cannot read tls auth file')
         index_start = MAX_CIPHER_KEY_LENGTH
         hmac_key_0 = key[index_start:index_start + MAX_HMAC_KEY_LENGTH]
         index_start = MAX_CIPHER_KEY_LENGTH + MAX_HMAC_KEY_LENGTH + MAX_CIPHER_KEY_LENGTH
